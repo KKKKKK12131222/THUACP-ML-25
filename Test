@@ -1,0 +1,238 @@
+import os
+import glob
+import itertools
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Optional
+import warnings
+
+# 忽略运行时的除零警告等
+warnings.filterwarnings('ignore')
+
+class MouseFeatureEngineer:
+    """
+    MABe Challenge 特征工程处理器。
+    负责从原始Parquet文件中提取老鼠的运动学特征和交互特征。
+    """
+    
+    def __init__(self, input_dir: str, output_dir: str):
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def load_and_pivot(self, file_path: str) -> pd.DataFrame:
+        """
+        读取Parquet文件并将长表转换为宽表格式。
+        """
+        try:
+            df = pd.read_parquet(file_path)
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            return pd.DataFrame()
+
+        # 标准化列名
+        col_map = {'mouse_id': 'agent_id', 'bodypart': 'keypoint'}
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        
+        # 创建多级索引列名: mouse_id_keypoint_coord
+        df['feature_col_x'] = "m" + df['agent_id'].astype(str) + "_" + df['keypoint'] + "_x"
+        df['feature_col_y'] = "m" + df['agent_id'].astype(str) + "_" + df['keypoint'] + "_y"
+        
+        # 透视表操作
+        pivot_x = df.pivot(index='video_frame', columns='feature_col_x', values='x')
+        pivot_y = df.pivot(index='video_frame', columns='feature_col_y', values='y')
+        
+        # 合并并重置索引
+        full_df = pd.concat([pivot_x, pivot_y], axis=1)
+        full_df = full_df.sort_index(axis=1).reset_index()
+        
+        return full_df
+
+    def _get_agents_and_parts(self, df: pd.DataFrame):
+        """解析DataFrame中的老鼠ID和身体部位"""
+        cols = [c for c in df.columns if c.startswith('m')]
+        agents = sorted(list(set([c.split('_')[0] for c in cols])))
+        
+        # 推断身体部位 (使用第一个agent作为模板)
+        if agents:
+            sample_agent = agents[0]
+            agent_cols = [c for c in cols if c.startswith(f"{sample_agent}_") and c.endswith('_x')]
+            parts = [c.replace(f"{sample_agent}_", "").replace("_x", "") for c in agent_cols]
+        else:
+            parts = []
+            
+        return agents, parts
+
+    def add_distance_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算欧几里得距离特征 (个体内部 & 个体之间)"""
+        agents, parts = self._get_agents_and_parts(df)
+        new_feats = {}
+        
+        # 1. 个体内部距离 (Intra-agent) - 描述姿态
+        for agent in agents:
+            # 选取几个关键部位组合以减少维度，而非全部组合
+            key_pairs = itertools.combinations(parts, 2)
+            for p1, p2 in key_pairs:
+                kp1_x, kp1_y = f"{agent}_{p1}_x", f"{agent}_{p1}_y"
+                kp2_x, kp2_y = f"{agent}_{p2}_x", f"{agent}_{p2}_y"
+                
+                if {kp1_x, kp1_y, kp2_x, kp2_y}.issubset(df.columns):
+                    dist = np.sqrt((df[kp1_x] - df[kp2_x])**2 + (df[kp1_y] - df[kp2_y])**2)
+                    new_feats[f"dist_{agent}_{p1}_{p2}"] = dist
+
+        # 2. 个体间距离 (Inter-agent) - 描述社交距离
+        # 仅计算关键部位：如鼻子、重心、颈部
+        social_parts = [p for p in ['nose', 'center', 'neck', 'tail_base'] if p in parts]
+        if not social_parts and parts:
+            social_parts = parts[:2] # Fallback
+
+        if len(agents) >= 2:
+            # 假设主要是两只老鼠的互动，如果是多只，这里需要调整逻辑
+            a1, a2 = agents[0], agents[1]
+            for sp in social_parts:
+                c1_x, c1_y = f"{a1}_{sp}_x", f"{a1}_{sp}_y"
+                c2_x, c2_y = f"{a2}_{sp}_x", f"{a2}_{sp}_y"
+                
+                if {c1_x, c1_y, c2_x, c2_y}.issubset(df.columns):
+                    dist = np.sqrt((df[c1_x] - df[c2_x])**2 + (df[c1_y] - df[c2_y])**2)
+                    new_feats[f"social_dist_{sp}"] = dist
+
+        return pd.concat([df, pd.DataFrame(new_feats, index=df.index)], axis=1)
+
+    def add_kinematic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算速度和加速度"""
+        agents, parts = self._get_agents_and_parts(df)
+        new_feats = {}
+        
+        for agent in agents:
+            for part in parts:
+                cx, cy = f"{agent}_{part}_x", f"{agent}_{part}_y"
+                if cx not in df.columns: continue
+                
+                # 速度 (Velocity)
+                dx = df[cx].diff().fillna(0)
+                dy = df[cy].diff().fillna(0)
+                speed = np.sqrt(dx**2 + dy**2)
+                
+                new_feats[f"v_{agent}_{part}"] = speed
+                
+                # 加速度 (Acceleration) - 原代码没有，增加差异度
+                acc = speed.diff().fillna(0)
+                new_feats[f"acc_{agent}_{part}"] = acc
+
+        return pd.concat([df, pd.DataFrame(new_feats, index=df.index)], axis=1)
+
+    def _calc_vector_angle(self, vec_a, vec_b):
+        """计算两个向量之间的夹角"""
+        dot_product = (vec_a * vec_b).sum(axis=1)
+        norm_a = np.linalg.norm(vec_a, axis=1)
+        norm_b = np.linalg.norm(vec_b, axis=1)
+        
+        cos_sim = dot_product / (norm_a * norm_b + 1e-8)
+        return np.arccos(np.clip(cos_sim, -1.0, 1.0))
+
+    def add_angle_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算相对角度特征 (例如：老鼠A是否看着老鼠B)"""
+        agents, _ = self._get_agents_and_parts(df)
+        if len(agents) < 2:
+            return df
+            
+        new_feats = {}
+        # 这里的逻辑是：Head Vector = Nose - Neck
+        # Vector to Other = Other Nose - Self Neck
+        
+        for current_agent in agents:
+            others = [a for a in agents if a != current_agent]
+            for other in others:
+                # 检查必要列是否存在
+                req_cols = [f"{current_agent}_nose", f"{current_agent}_neck", f"{other}_nose"]
+                if not all(f"{c}_x" in df.columns for c in req_cols):
+                    continue
+                
+                # 构建向量
+                neck_x = df[f"{current_agent}_neck_x"]
+                neck_y = df[f"{current_agent}_neck_y"]
+                nose_x = df[f"{current_agent}_nose_x"]
+                nose_y = df[f"{current_agent}_nose_y"]
+                
+                target_x = df[f"{other}_nose_x"]
+                target_y = df[f"{other}_nose_y"]
+                
+                # 向量计算
+                vec_head = np.stack([nose_x - neck_x, nose_y - neck_y], axis=1)
+                vec_target = np.stack([target_x - neck_x, target_y - neck_y], axis=1)
+                
+                angle = self._calc_vector_angle(vec_head, vec_target)
+                new_feats[f"angle_{current_agent}_to_{other}"] = angle
+                
+        return pd.concat([df, pd.DataFrame(new_feats, index=df.index)], axis=1)
+
+    def add_rolling_stats(self, df: pd.DataFrame, window_sizes=[5, 10]) -> pd.DataFrame:
+        """计算滑动窗口统计量 (Mean, Std)"""
+        # 仅针对数值型特征（主要是距离和速度）
+        target_cols = [c for c in df.columns if c.startswith(('dist_', 'social_', 'v_', 'acc_'))]
+        
+        if not target_cols:
+            return df
+            
+        new_feats = {}
+        for win in window_sizes:
+            # 使用 rolling 批量计算
+            rolled = df[target_cols].rolling(window=win, min_periods=1)
+            mean_df = rolled.mean()
+            std_df = rolled.std().fillna(0)
+            
+            mean_df.columns = [f"{c}_mean{win}" for c in mean_df.columns]
+            std_df.columns = [f"{c}_std{win}" for c in std_df.columns]
+            
+            new_feats[f"mean_{win}"] = mean_df
+            new_feats[f"std_{win}"] = std_df
+            
+        # 将字典中的DataFrame合并
+        to_concat = [df] + list(new_feats.values())
+        return pd.concat(to_concat, axis=1)
+
+    def process_all(self):
+        """主执行管道"""
+        parquet_files = glob.glob(os.path.join(self.input_dir, "**/*.parquet"), recursive=True)
+        print(f"Found {len(parquet_files)} files to process.")
+        
+        processed_count = 0
+        
+        for fpath in parquet_files[:100]:
+            file_name = os.path.basename(fpath).replace('.parquet', '.csv')
+            save_path = os.path.join(self.output_dir, file_name)
+            
+            # 避免重复计算
+            if os.path.exists(save_path):
+                continue
+                
+            # 1. Pivot
+            df = self.load_and_pivot(fpath)
+            if df.empty: continue
+            
+            # 2. Feature Engineering
+            df = self.add_distance_features(df)
+            df = self.add_kinematic_features(df)
+            df = self.add_angle_features(df)
+            df = self.add_rolling_stats(df, window_sizes=[5, 15]) # 窗口大小做了微调
+            
+            # 3. Save (可以选择压缩以节省空间)
+            df.to_csv(save_path, index=False)
+            processed_count += 1
+            
+            if processed_count % 5 == 0:
+                print(f"Processed {processed_count} videos...")
+
+def main():
+    # 配置路径
+    INPUT_ROOT = "/kaggle/input/MABe-mouse-behavior-detection/train_tracking"
+    OUTPUT_ROOT = "/kaggle/working/processed_features/"
+    
+    # 实例化并运行
+    engineer = MouseFeatureEngineer(INPUT_ROOT, OUTPUT_ROOT)
+    engineer.process_all()
+    print("Data preprocessing complete.")
+
+if __name__ == "__main__":
+    main()
